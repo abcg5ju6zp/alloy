@@ -44,7 +44,11 @@ The following triggers a poll:
 - Every time the component's arguments get re-evaluated.
 - At the frequency specified by the `poll_frequency` argument.
 
-Any error while polling marks the component as unhealthy.
+Polls are processed in Kubernetes resource version order.
+A response carrying an older resource version than the version already applied is ignored and doesn't change the exported data or the component health.
+If reading or processing a newer version fails, the component keeps exporting the data from the last successfully applied version and reports the error.
+When the ConfigMap is deleted, the component exports no data and stays healthy; if the ConfigMap is re-created, its data is exported again on a later poll.
+If the ConfigMap doesn't exist when the component is first loaded, the initial poll fails and the component reports unhealthy, as with any other polling error.
 After a successful poll, `remote.kubernetes.configmap` exports all data with the same field names as the source ConfigMap.
 
 ## Blocks
@@ -129,7 +133,8 @@ The `data` field contains a mapping from field names to values.
 
 ## Component health
 
-Instances of `remote.kubernetes.configmap` report as healthy if the most recent attempt to poll the Kubernetes API succeeds.
+Instances of `remote.kubernetes.configmap` report as healthy if the most recent attempt to poll the Kubernetes API succeeds, including when the ConfigMap is deleted.
+They report as unhealthy if a poll fails while a previous version is still being exported; a response older than the applied resource version is ignored and doesn't change the reported health.
 
 ## Debug information
 
