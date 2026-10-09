@@ -2,12 +2,12 @@ package vault
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
 
 	vault "github.com/hashicorp/vault/api"
-	"github.com/oklog/run"
 
 	"github.com/grafana/alloy/internal/component"
 	"github.com/grafana/alloy/internal/featuregate"
@@ -128,16 +128,72 @@ type Exports struct {
 	Data map[string]alloytypes.Secret `alloy:"data,attr"`
 }
 
+// errComponentStopped is returned when Update is invoked after Run has exited.
+var errComponentStopped = errors.New("component has stopped and no longer accepts updates")
+
+// A session bundles everything tied to one effective configuration: the
+// Vault client, the authenticated token, the retrieved secret and the
+// managers maintaining their lifetimes.
+//
+// A session is fully prepared (client created, authentication successful,
+// secret read and lifetime watchers prepared) before it replaces the active
+// session. If any preparation step fails, the candidate is discarded and the
+// previously active session keeps serving with its old token, old secret and
+// old lease renewals.
+type session struct {
+	args Arguments
+	cli  *vault.Client
+
+	auth   *tokenManager
+	secret *tokenManager
+
+	// cancel stops the session's background processing. It is set by Run when
+	// the session becomes supervised; nil for sessions that never reached Run
+	// before being superseded.
+	cancel context.CancelFunc
+	// done is closed once all background loops have exited and the last
+	// lifetime watchers are stopped.
+	done chan struct{}
+}
+
+// requestStop asks the session to stop all background processing. It is safe
+// to call on sessions that were never supervised.
+func (s *session) requestStop() {
+	if s.cancel != nil {
+		s.cancel()
+	}
+}
+
+// dispose releases resources held by a session whose background processing was
+// never started.
+func (s *session) dispose() {
+	s.auth.stopTicker()
+	s.secret.stopTicker()
+}
+
 // Component implements the remote.vault component.
 type Component struct {
 	opts    component.Options
 	metrics *metrics
 
-	mut  sync.RWMutex
-	args Arguments // Arguments to the component.
+	// updateMu serializes configuration updates. Only the fully prepared
+	// candidate of the latest Update call can become the active session.
+	updateMu sync.Mutex
 
-	secretManager *tokenManager
-	authManager   *tokenManager
+	// stateMut guards active. Exports are published while holding stateMut so
+	// a retiring session can never publish after a newer session took over.
+	stateMut sync.RWMutex
+	active   *session
+
+	// sessionChanged wakes Run so it supervises the newest active session.
+	sessionChanged chan struct{}
+
+	// runLifecycle tracks the lifetime of Run. runCtx is set while Run may
+	// supervise sessions; finished is set once Run has exited, after which
+	// Updates are rejected.
+	runLifecycle sync.Mutex
+	runCtx       context.Context
+	finished     bool
 }
 
 var (
@@ -151,8 +207,9 @@ var (
 // authentication against the Vault server fails.
 func New(opts component.Options, args Arguments) (*Component, error) {
 	c := &Component{
-		opts:    opts,
-		metrics: newMetrics(opts.Registerer),
+		opts:           opts,
+		metrics:        newMetrics(opts.Registerer),
+		sessionChanged: make(chan struct{}, 1),
 	}
 
 	if err := c.Update(args); err != nil {
@@ -161,117 +218,244 @@ func New(opts component.Options, args Arguments) (*Component, error) {
 	return c, nil
 }
 
-// Run runs the remote.vault component, managing the lifetime of the retrieved
-// secret and renewing/rereading it as necessary.
+// Run runs the remote.vault component, supervising the active session. When a
+// newer session is committed, the previous session's background processing is
+// canceled and fully stopped before the new one is started.
 func (c *Component) Run(ctx context.Context) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	c.runLifecycle.Lock()
+	c.runCtx = ctx
+	c.runLifecycle.Unlock()
 
-	var rg run.Group
+	var supervised *session
 
-	rg.Add(func() error {
-		c.secretManager.Run(ctx)
-		return nil
-	}, func(_ error) {
-		cancel()
-	})
+	defer func() {
+		// A session committed while Run was exiting never got supervised;
+		// release its idle resources. Updates arriving afterwards are
+		// rejected once finished is set.
+		c.stateMut.Lock()
+		if c.active != nil && c.active != supervised {
+			c.active.dispose()
+		}
+		c.runLifecycle.Lock()
+		c.finished = true
+		c.runLifecycle.Unlock()
+		c.stateMut.Unlock()
+	}()
 
-	rg.Add(func() error {
-		c.authManager.Run(ctx)
-		return nil
-	}, func(_ error) {
-		cancel()
-	})
+	retire := func(s *session) {
+		if s == nil {
+			return
+		}
+		s.requestStop()
+		<-s.done
+	}
 
-	return rg.Run()
+	for {
+		c.stateMut.RLock()
+		s := c.active
+		c.stateMut.RUnlock()
+
+		if s != supervised {
+			// Stop the previous session completely (no late status, no
+			// lingering renewals) before any processing for the new session
+			// starts.
+			retire(supervised)
+
+			sessionCtx, cancel := context.WithCancel(ctx)
+
+			c.stateMut.Lock()
+			if c.active != s {
+				// The candidate was superseded before it was ever supervised;
+				// drop it without starting any background processing and
+				// re-evaluate the latest session.
+				c.stateMut.Unlock()
+				cancel()
+				continue
+			}
+			s.cancel = cancel
+			c.stateMut.Unlock()
+
+			go c.runSession(sessionCtx, s)
+			supervised = s
+		}
+
+		select {
+		case <-ctx.Done():
+			retire(supervised)
+			return nil
+		case <-c.sessionChanged:
+		}
+	}
 }
 
-// Update updates the remote.vault component. It will try to immediately read
-// the secret from Vault and return an error if the secret can't be read.
+// runSession runs all background processing for s until ctx is canceled. It
+// closes s.done after every loop has exited and the last lifetime watchers
+// have been stopped.
+func (c *Component) runSession(ctx context.Context, s *session) {
+	defer close(s.done)
+
+	var wg sync.WaitGroup
+
+	// publishSecret is invoked from the secret manager after a successful
+	// forced retrieval. It drops the event when the session has already been
+	// superseded, so stale sessions can never emit exports. The read lock
+	// serializes against the commit swap.
+	publishSecret := func(secret *vault.Secret) {
+		c.stateMut.RLock()
+		defer c.stateMut.RUnlock()
+
+		if c.active != s {
+			return
+		}
+		c.emitExports(secret)
+	}
+
+	// Auth token refreshes don't publish exports.
+	s.auth.start(ctx, &wg, nil)
+	s.secret.start(ctx, &wg, publishSecret)
+
+	wg.Wait()
+
+	// All loops have exited; stop the watchers they were processing so no
+	// renewal goroutine outlives the session.
+	s.auth.stopWatcher()
+	s.secret.stopWatcher()
+}
+
+// Update updates the remote.vault component. The new configuration is prepared
+// as a candidate session and only takes effect atomically once the client was
+// created, authentication succeeded, the secret was read and the lifetime
+// watchers are ready. Any failure leaves the active session completely
+// unchanged.
 func (c *Component) Update(args component.Arguments) error {
 	newArgs := args.(Arguments)
 
-	newClient, err := newArgs.client()
+	parent := c.updateParentContext()
+	if parent == nil {
+		return errComponentStopped
+	}
+
+	c.updateMu.Lock()
+	defer c.updateMu.Unlock()
+
+	candidate, err := c.buildSession(parent, newArgs)
 	if err != nil {
 		return err
 	}
-
-	c.mut.Lock()
-	c.args = newArgs
-	c.mut.Unlock()
-
-	// Configure the token manager for authentication tokens and secrets.
-	// authManager *must* be configured first to ensure that the client is
-	// authenticated to Vault when retrieving the secret.
-
-	if c.authManager == nil {
-		// NOTE(rfratto): we pass 0 for the refresh interval because we don't
-		// support refreshing the auth token on an interval.
-		mgr, err := newTokenManager(tokenManagerOptions{
-			Log:    c.opts.Logger.With("token_type", "auth"),
-			Client: newClient,
-			Getter: c.getAuthToken,
-
-			ReadCounter:    c.metrics.authTotal,
-			RefreshCounter: c.metrics.authLeaseRenewalTotal,
-		})
-		if err != nil {
-			return err
-		}
-		c.authManager = mgr
-	} else {
-		c.authManager.SetClient(newClient)
-	}
-
-	if c.secretManager == nil {
-		mgr, err := newTokenManager(tokenManagerOptions{
-			Log:             c.opts.Logger.With("token_type", "secret"),
-			Client:          newClient,
-			Getter:          c.getSecret,
-			RefreshInterval: newArgs.RereadFrequency,
-
-			ReadCounter:    c.metrics.secretReadTotal,
-			RefreshCounter: c.metrics.secretLeaseRenewalTotal,
-		})
-		if err != nil {
-			return err
-		}
-		c.secretManager = mgr
-	} else {
-		c.secretManager.SetClient(newClient)
-		c.secretManager.SetRefreshInterval(newArgs.RereadFrequency)
-	}
-
+	c.commitSession(candidate)
 	return nil
 }
 
-func (c *Component) getAuthToken(ctx context.Context, cli *vault.Client) (*vault.Secret, error) {
-	c.mut.RLock()
-	defer c.mut.RUnlock()
+// updateParentContext returns the context candidate preparation is bound to.
+// It is nil once Run has exited so updates during shutdown are rejected.
+func (c *Component) updateParentContext() context.Context {
+	c.runLifecycle.Lock()
+	defer c.runLifecycle.Unlock()
 
-	authMethod := c.args.authMethod()
-	return authMethod.vaultAuthenticate(ctx, cli)
+	if c.finished {
+		return nil
+	}
+	if c.runCtx != nil {
+		return c.runCtx
+	}
+	return context.Background()
 }
 
-func (c *Component) getSecret(ctx context.Context, cli *vault.Client) (*vault.Secret, error) {
-	c.mut.RLock()
-	defer c.mut.RUnlock()
-
-	store := c.args.secretStore(cli)
-	secret, err := store.Read(ctx, &c.args)
+// buildSession prepares a candidate session without touching the active
+// session. The auth manager is prepared first so the client is authenticated
+// before reading the secret.
+func (c *Component) buildSession(parent context.Context, args Arguments) (*session, error) {
+	cli, err := args.client()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("creating vault client: %w", err)
 	}
 
-	// Export the secret so other components can use it.
-	c.exportSecret(secret)
+	candidate := &session{
+		args: args,
+		cli:  cli,
+		done: make(chan struct{}),
+	}
 
-	return secret, nil
+	authCtx, cancelAuth := context.WithTimeout(parent, tokenManagerInitializeTimeout)
+	authManager, err := newTokenManager(authCtx, tokenManagerOptions{
+		Log:    c.opts.Logger.With("token_type", "auth"),
+		Client: cli,
+		Getter: func(ctx context.Context, cli *vault.Client) (*vault.Secret, error) {
+			return args.authMethod().vaultAuthenticate(ctx, cli)
+		},
+
+		ReadCounter:    c.metrics.authTotal,
+		RefreshCounter: c.metrics.authLeaseRenewalTotal,
+	})
+	cancelAuth()
+	if err != nil {
+		// Auth failure: discard the candidate entirely. The old client, token
+		// and renewal keep running untouched.
+		return nil, fmt.Errorf("authenticating to vault: %w", err)
+	}
+	candidate.auth = authManager
+
+	secretCtx, cancelSecret := context.WithTimeout(parent, tokenManagerInitializeTimeout)
+	secretManager, err := newTokenManager(secretCtx, tokenManagerOptions{
+		Log:    c.opts.Logger.With("token_type", "secret"),
+		Client: cli,
+		Getter: func(ctx context.Context, cli *vault.Client) (*vault.Secret, error) {
+			return args.secretStore(cli).Read(ctx, &args)
+		},
+		RefreshInterval: args.RereadFrequency,
+
+		ReadCounter:    c.metrics.secretReadTotal,
+		RefreshCounter: c.metrics.secretLeaseRenewalTotal,
+	})
+	cancelSecret()
+	if err != nil {
+		// Secret failure: discard the candidate, including the freshly
+		// authenticated token (its watcher was never started). The old token,
+		// secret and their renewals keep running untouched.
+		return nil, fmt.Errorf("reading secret from vault: %w", err)
+	}
+	candidate.secret = secretManager
+
+	return candidate, nil
 }
 
-// exportSecret converts the secret into exports and exports it to the
+// commitSession atomically replaces the active session, publishes the new
+// exports and retires the previous session. Only Run (supervision, renewal)
+// and the newest session may publish component state afterwards.
+func (c *Component) commitSession(s *session) {
+	c.stateMut.Lock()
+	old := c.active
+	wasSupervised := old != nil && old.cancel != nil
+	c.active = s
+	// Publish exports as part of the swap; exports, health and debug info
+	// always reference the same configuration.
+	c.emitExports(s.secret.currentSecret())
+	c.stateMut.Unlock()
+
+	// Wake Run. Coalesced: if updates arrive faster than Run processes them,
+	// Run jumps straight to the latest session; intermediate sessions are
+	// never supervised.
+	select {
+	case c.sessionChanged <- struct{}{}:
+	default:
+	}
+
+	if old == nil {
+		return
+	}
+	if !wasSupervised {
+		// Old session was never supervised; release its idle resources.
+		old.dispose()
+	} else {
+		// Stop old renewal loops as promptly as possible; Run joins them
+		// before supervising the new session.
+		old.requestStop()
+	}
+}
+
+// emitExports converts the secret into exports and publishes it to the
 // controller.
-func (c *Component) exportSecret(secret *vault.Secret) {
+func (c *Component) emitExports(secret *vault.Secret) {
 	newExports := Exports{
 		Data: make(map[string]alloytypes.Secret),
 	}
@@ -296,21 +480,48 @@ func (c *Component) exportSecret(secret *vault.Secret) {
 	c.opts.OnStateChange(newExports)
 }
 
+// activeSupervised reports whether Run has started background processing for
+// the currently active session.
+func (c *Component) activeSupervised() bool {
+	c.stateMut.RLock()
+	defer c.stateMut.RUnlock()
+	return c.active != nil && c.active.cancel != nil
+}
+
 // CurrentHealth returns the current health of the remote.vault component. It
-// will be healthy as long as the latest read or renewal was successful.
+// will be healthy as long as the latest read or renewal of the active session
+// was successful.
 func (c *Component) CurrentHealth() component.Health {
+	c.stateMut.RLock()
+	s := c.active
+	c.stateMut.RUnlock()
+
+	if s == nil {
+		return component.Health{
+			Health:     component.HealthTypeUnhealthy,
+			Message:    "component has no active session",
+			UpdateTime: time.Now(),
+		}
+	}
 	return component.LeastHealthy(
-		c.authManager.CurrentHealth(),
-		c.secretManager.CurrentHealth(),
+		s.auth.CurrentHealth(),
+		s.secret.CurrentHealth(),
 	)
 }
 
 // DebugInfo returns debug information about the remote.vault component. It
 // includes non-sensitive metadata about the current secret.
 func (c *Component) DebugInfo() any {
+	c.stateMut.RLock()
+	s := c.active
+	c.stateMut.RUnlock()
+
+	if s == nil {
+		return debugInfo{}
+	}
 	return debugInfo{
-		AuthToken: c.authManager.DebugInfo(),
-		Secret:    c.secretManager.DebugInfo(),
+		AuthToken: s.auth.DebugInfo(),
+		Secret:    s.secret.DebugInfo(),
 	}
 }
 
