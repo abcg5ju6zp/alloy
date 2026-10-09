@@ -56,6 +56,16 @@ type testCase struct {
 	minimumClusterSize     int
 	minimumSizeWaitTimeout time.Duration
 	clusterTLS             bool // when true, nodes serve their HTTP/cluster port over TLS
+
+	// discoveryErrorNodes lists nodes whose peer discovery function always
+	// returns an error.
+	discoveryErrorNodes []string
+	// handoffTimeout overrides the per-component hand-off timeout for all
+	// nodes; zero uses the default.
+	handoffTimeout time.Duration
+	// convergeStableFor overrides how long the peer view must be stable before
+	// a graceful leave considers the cluster converged; zero uses the default.
+	convergeStableFor time.Duration
 }
 
 func TestClusterE2E(t *testing.T) {
@@ -418,6 +428,198 @@ func TestClusterE2E(t *testing.T) {
 				}
 			},
 		},
+		{
+			name:             "graceful leave hands off sharded components",
+			nodeCountInitial: 3,
+			alloyConfig:      `testcomponents.cluster_handoff_tracker "foo" {}`,
+			extraAllowedErrors: []string{
+				"failed to broadcast leave message to cluster",
+				"timeout waiting for leave broadcast",
+			},
+			assertionsInitial: func(t *assert.CollectT, state *testState) {
+				for _, p := range state.peers {
+					verifyMetrics(t, p,
+						`cluster_node_info{state="participant"} 1`,
+						`cluster_node_peers{cluster_name="cluster_e2e_test",state="participant"} 3`,
+						`cluster_node_gossip_alive_peers{cluster_name="cluster_e2e_test"} 3`,
+					)
+					verifyPeers(t, p, 3)
+					verifyClusterReady(t, p)
+				}
+				verifyLookupInvariants(t, state.peers)
+			},
+			changes: func(state *testState) {
+				leaving := state.peers[0]
+				leaveCtx, leaveCancel := context.WithTimeout(state.ctx, 30*time.Second)
+				defer leaveCancel()
+
+				require.NoError(t, leaving.clusterService.GracefulLeave(leaveCtx))
+
+				// The leaving node reported Terminating and its component
+				// completed the hand-off exactly once.
+				requireSelfState(t, leaving, peer.StateTerminating)
+				verifyMetricsNow(t, leaving,
+					`cluster_handoffs_total{component_id="testcomponents.cluster_handoff_tracker.foo",component_path="/"} 1`,
+				)
+
+				leaving.shutdown()
+				state.peers = state.peers[1:]
+			},
+			assertionsFinal: func(t *assert.CollectT, state *testState) {
+				for _, p := range state.peers {
+					verifyMetrics(t, p,
+						`cluster_node_info{state="participant"} 1`,
+						`cluster_node_peers{cluster_name="cluster_e2e_test",state="participant"} 2`,
+						`cluster_node_gossip_alive_peers{cluster_name="cluster_e2e_test"} 2`,
+					)
+					verifyPeers(t, p, 2)
+				}
+				verifyLookupInvariants(t, state.peers)
+			},
+		},
+		{
+			name:               "graceful leave aborted below minimum cluster size",
+			nodeCountInitial:   3,
+			minimumClusterSize: 3,
+			alloyConfig:        `testcomponents.cluster_state_tracker "foo" {}`,
+			extraAllowedErrors: []string{
+				"aborting graceful cluster leave",
+			},
+			assertionsInitial: func(t *assert.CollectT, state *testState) {
+				for _, p := range state.peers {
+					verifyPeers(t, p, 3)
+					verifyClusterReady(t, p)
+				}
+				verifyLookupInvariants(t, state.peers)
+			},
+			changes: func(state *testState) {
+				leaveCtx, leaveCancel := context.WithTimeout(state.ctx, 30*time.Second)
+				defer leaveCancel()
+
+				err := state.peers[0].clusterService.GracefulLeave(leaveCtx)
+				require.Error(t, err)
+				require.ErrorIs(t, err, cluster.ErrGracefulLeaveAborted)
+				require.ErrorIs(t, err, cluster.ErrMinimumClusterSizeNotMet)
+
+				// The exit was revoked: the node stays a Participant and all
+				// three nodes keep serving.
+				requireSelfState(t, state.peers[0], peer.StateParticipant)
+				for _, p := range state.peers {
+					requireParticipantPeers(t, p, 3)
+				}
+
+				// Retrying the leave aborts again while the cluster is too small.
+				err = state.peers[0].clusterService.GracefulLeave(leaveCtx)
+				require.ErrorIs(t, err, cluster.ErrGracefulLeaveAborted)
+				requireSelfState(t, state.peers[0], peer.StateParticipant)
+			},
+			assertionsFinal: func(t *assert.CollectT, state *testState) {
+				for _, p := range state.peers {
+					verifyMetrics(t, p,
+						`cluster_node_info{state="participant"} 1`,
+						`cluster_node_peers{cluster_name="cluster_e2e_test",state="participant"} 3`,
+					)
+					verifyPeers(t, p, 3)
+					verifyClusterReady(t, p)
+				}
+				verifyLookupInvariants(t, state.peers)
+			},
+		},
+		{
+			name:                 "graceful leave aborted when peer discovery fails",
+			nodeCountInitial:     3,
+			discoveryErrorNodes:  []string{"node-0"},
+			alloyConfig:          `testcomponents.cluster_state_tracker "foo" {}`,
+			extraAllowedErrors: []string{
+				"failed to get peers to join at startup",
+				"failed to refresh list of peers",
+				"aborting graceful cluster leave",
+			},
+			assertionsInitial: func(t *assert.CollectT, state *testState) {
+				for _, p := range state.peers {
+					verifyPeers(t, p, 3)
+					verifyClusterReady(t, p)
+				}
+				verifyLookupInvariants(t, state.peers)
+			},
+			changes: func(state *testState) {
+				leaveCtx, leaveCancel := context.WithTimeout(state.ctx, 30*time.Second)
+				defer leaveCancel()
+
+				err := state.peers[0].clusterService.GracefulLeave(leaveCtx)
+				require.Error(t, err)
+				require.ErrorIs(t, err, cluster.ErrGracefulLeaveAborted)
+				require.ErrorIs(t, err, cluster.ErrPeerDiscoveryFailed)
+
+				// Discovery failed: the node keeps serving.
+				requireSelfState(t, state.peers[0], peer.StateParticipant)
+				for _, p := range state.peers {
+					requireParticipantPeers(t, p, 3)
+				}
+			},
+			assertionsFinal: func(t *assert.CollectT, state *testState) {
+				for _, p := range state.peers {
+					verifyMetrics(t, p,
+						`cluster_node_info{state="participant"} 1`,
+						`cluster_node_peers{cluster_name="cluster_e2e_test",state="participant"} 3`,
+					)
+					verifyPeers(t, p, 3)
+					verifyClusterReady(t, p)
+				}
+				verifyLookupInvariants(t, state.peers)
+			},
+		},
+		{
+			name:               "graceful leave forced after handoff timeout writes recovery marker",
+			nodeCountInitial:   3,
+			handoffTimeout:     400 * time.Millisecond,
+			convergeStableFor: 300 * time.Millisecond,
+			alloyConfig:        `testcomponents.cluster_handoff_tracker "foo" { handoff_lag = "5s" }`,
+			extraAllowedErrors: []string{
+				"did not complete cluster shard hand-off",
+				"forcing leave and persisting recovery marker",
+				"failed to broadcast leave message to cluster",
+				"timeout waiting for leave broadcast",
+			},
+			assertionsInitial: func(t *assert.CollectT, state *testState) {
+				for _, p := range state.peers {
+					verifyMetrics(t, p,
+						`cluster_node_info{state="participant"} 1`,
+						`cluster_node_peers{cluster_name="cluster_e2e_test",state="participant"} 3`,
+					)
+					verifyPeers(t, p, 3)
+					verifyClusterReady(t, p)
+				}
+				verifyLookupInvariants(t, state.peers)
+			},
+			changes: func(state *testState) {
+				leaving := state.peers[0]
+				leaveCtx, leaveCancel := context.WithTimeout(state.ctx, 30*time.Second)
+				defer leaveCancel()
+
+				// The hand-off cannot finish within the deadline; the leave is
+				// forced and a recoverable marker is persisted.
+				require.NoError(t, leaving.clusterService.GracefulLeave(leaveCtx))
+				requireSelfState(t, leaving, peer.StateTerminating)
+
+				markerPath := path.Join(leaving.dataPath, "cluster", "forced-leave.json")
+				_, err := os.Stat(markerPath)
+				require.NoError(t, err, "expected forced-leave recovery marker at %s", markerPath)
+
+				leaving.shutdown()
+				state.peers = state.peers[1:]
+			},
+			assertionsFinal: func(t *assert.CollectT, state *testState) {
+				for _, p := range state.peers {
+					verifyMetrics(t, p,
+						`cluster_node_info{state="participant"} 1`,
+						`cluster_node_peers{cluster_name="cluster_e2e_test",state="participant"} 2`,
+					)
+					verifyPeers(t, p, 2)
+				}
+				verifyLookupInvariants(t, state.peers)
+			},
+		},
 	}
 
 	setDefaults := func(tc *testCase) {
@@ -498,12 +700,14 @@ func verifyClusterReady(t *assert.CollectT, p *testPeer) {
 type testPeer struct {
 	nodeName          string
 	address           string
+	dataPath          string
 	clusterService    *cluster.Service
 	httpService       *httpservice.Service
 	ctx               context.Context
 	shutdown          context.CancelFunc
 	mutex             sync.Mutex
 	discoverablePeers []string // list of peers that this peer can discover
+	discoveryErr      bool     // when true, the discovery function always errors
 	logsWriter        *logsWriter
 
 	scheme        string       // "http" or "https" for reaching this peer
@@ -514,6 +718,9 @@ func (p *testPeer) discoveryFn(_ discovery.Options) (discovery.DiscoverFn, error
 	return func() ([]string, error) {
 		p.mutex.Lock()
 		defer p.mutex.Unlock()
+		if p.discoveryErr {
+			return nil, fmt.Errorf("simulated discovery failure for %s", p.nodeName)
+		}
 		return p.discoverablePeers, nil
 	}, nil
 }
@@ -560,6 +767,7 @@ func startNewNode(t *testing.T, state *testState, nodeName string) {
 		ctx:               peerCtx,
 		shutdown:          peerCancel,
 		discoverablePeers: joinPeers,
+		discoveryErr:      slices.Contains(state.testCase.discoveryErrorNodes, nodeName),
 		scheme:            "http",
 		metricsClient:     http.DefaultClient,
 	}
@@ -571,6 +779,7 @@ func startNewNode(t *testing.T, state *testState, nodeName string) {
 	}
 
 	nodeDirPath := path.Join(t.TempDir(), nodeName)
+	newPeer.dataPath = nodeDirPath
 	newPeer.logsWriter = &logsWriter{
 		t:                  t,
 		out:                os.Stdout,
@@ -605,6 +814,9 @@ func startNewNode(t *testing.T, state *testState, nodeName string) {
 		ClusterName:            "cluster_e2e_test",
 		MinimumClusterSize:     state.testCase.minimumClusterSize,
 		MinimumSizeWaitTimeout: state.testCase.minimumSizeWaitTimeout,
+		DataPath:               nodeDirPath,
+		ComponentHandoffTimeout: state.testCase.handoffTimeout,
+		LeaveConvergeStableFor:  state.testCase.convergeStableFor,
 	}
 	if state.testCase.clusterTLS {
 		clusterOpts.EnableTLS = true
@@ -709,6 +921,54 @@ func verifyPeers(t *assert.CollectT, p *testPeer, expectedLength int) {
 		}
 	}
 	require.Fail(t, "Could not find self in peers")
+}
+
+// requireSelfState asserts the state of the local node as seen by its own
+// sharder.
+func requireSelfState(t *testing.T, p *testPeer, want peer.State) {
+	t.Helper()
+	clusterService, ok := p.clusterService.Data().(cluster.Cluster)
+	require.True(t, ok)
+	for _, actualPeer := range clusterService.Peers() {
+		if actualPeer.Self {
+			require.Equal(t, want, actualPeer.State)
+			return
+		}
+	}
+	require.Fail(t, "could not find self in peers")
+}
+
+// requireParticipantPeers asserts the node sees expectedLength peers and that
+// the local node is a Participant.
+func requireParticipantPeers(t *testing.T, p *testPeer, expectedLength int) {
+	t.Helper()
+	clusterService, ok := p.clusterService.Data().(cluster.Cluster)
+	require.True(t, ok)
+	peers := clusterService.Peers()
+	require.Len(t, peers, expectedLength)
+	for _, actualPeer := range peers {
+		if actualPeer.Self {
+			require.Equal(t, peer.StateParticipant, actualPeer.State)
+			return
+		}
+	}
+	require.Fail(t, "could not find self in peers")
+}
+
+// verifyMetricsNow is the *testing.T (non-Eventually) variant of verifyMetrics.
+func verifyMetricsNow(t *testing.T, p *testPeer, metrics ...string) {
+	t.Helper()
+	for _, m := range metrics {
+		metricsContainNow(t, p, m)
+	}
+}
+
+func metricsContainNow(t *testing.T, p *testPeer, text string) {
+	t.Helper()
+	metricsURL := fmt.Sprintf("%s://%s/metrics", p.scheme, p.address)
+	body, err := fetchMetrics(p.metricsClient, metricsURL)
+	require.NoError(t, err)
+	require.Contains(t, body, text+"\n")
 }
 
 func verifyMetrics(t *assert.CollectT, p *testPeer, metrics ...string) {

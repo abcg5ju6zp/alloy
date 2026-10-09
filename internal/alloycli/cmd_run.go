@@ -20,7 +20,6 @@ import (
 
 	"github.com/fatih/color"
 	"github.com/grafana/ckit/advertise"
-	"github.com/grafana/ckit/peer"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
@@ -39,6 +38,7 @@ import (
 	"github.com/grafana/alloy/internal/runtime/logging"
 	"github.com/grafana/alloy/internal/runtime/tracing"
 	"github.com/grafana/alloy/internal/service"
+	clustersvc "github.com/grafana/alloy/internal/service/cluster"
 	httpservice "github.com/grafana/alloy/internal/service/http"
 	"github.com/grafana/alloy/internal/service/labelstore"
 	"github.com/grafana/alloy/internal/service/livedebugging"
@@ -393,12 +393,24 @@ type runParams struct {
 	onConfigImport importsource.ImportContentHook
 }
 
+// clusterGracefulLeaveTimeout bounds how long a shutdown waits for a
+// coordinated cluster leave (state broadcast, peer convergence and component
+// shard hand-off) before proceeding with the regular shutdown.
+const clusterGracefulLeaveTimeout = 45 * time.Second
+
 func (fr *alloyRun) run(ctx context.Context, fset *pflag.FlagSet, params runParams) error {
 	var wg sync.WaitGroup
 	defer wg.Wait()
 
-	ctx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	// Signals are handled manually instead of with signal.NotifyContext so
+	// that the first interrupt can trigger a graceful cluster leave while
+	// components are still running. A second interrupt forces the shutdown.
+	sigCh := make(chan os.Signal, 2)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 
 	if err := fr.checkExperimentalFlags(); err != nil {
 		return err
@@ -503,10 +515,44 @@ func (fr *alloyRun) run(ctx context.Context, fset *pflag.FlagSet, params runPara
 		TLSServerName:          fr.clusterTLSServerName,
 		MinimumClusterSize:     fr.clusterWaitForSize,
 		MinimumSizeWaitTimeout: fr.clusterWaitTimeout,
+		DataPath:               fr.storagePath,
 	})
 	if err != nil {
 		return err
 	}
+
+	// On the first interrupt, attempt a coordinated cluster leave (freeze
+	// ownership, publish Terminating, wait for peers to converge on the new
+	// hash result and let components hand their shards off) while components
+	// are still running. If the leave is aborted (e.g. peers cannot be
+	// discovered or the minimum cluster size would not be met), the node
+	// keeps serving and waits for another interrupt. The actual process
+	// shutdown only starts once cancel runs below.
+	wg.Go(func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-sigCh:
+			}
+
+			leaveCtx, leaveCancel := context.WithTimeout(context.Background(), clusterGracefulLeaveTimeout)
+			leaveErr := clusterService.GracefulLeave(leaveCtx)
+			leaveCancel()
+
+			if errors.Is(leaveErr, clustersvc.ErrGracefulLeaveAborted) {
+				slogger.Warn(
+					"graceful cluster leave aborted; this node keeps serving its shards. Interrupt again to shut down anyway",
+					"err", leaveErr,
+				)
+				continue
+			} else if leaveErr != nil {
+				slogger.Error("graceful cluster leave failed; proceeding with shutdown", "err", leaveErr)
+			}
+			cancel()
+			return
+		}
+	})
 
 	runtimeFlags := []string{}
 	if !fr.disableSupportBundle {
@@ -643,8 +689,10 @@ func (fr *alloyRun) run(ctx context.Context, fset *pflag.FlagSet, params runPara
 	// By now, have either joined or started a new cluster.
 	// Nodes initially join in the Viewer state. After the graph has been
 	// loaded successfully, we can move to the Participant state to signal that
-	// we wish to participate in reading or writing data.
-	err = clusterService.ChangeState(ctx, peer.StateParticipant)
+	// we wish to participate in reading or writing data. When the previous run
+	// forced a leave without a confirmed shard hand-off, a recovery marker
+	// makes this wait in the Viewer state before taking write shards again.
+	err = clusterService.JoinAsParticipant(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to set clusterer state to Participant after initial load")
 	}

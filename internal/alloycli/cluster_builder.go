@@ -38,6 +38,18 @@ type ClusterOptions struct {
 	TLSCertPath            string
 	TLSKeyPath             string
 	TLSServerName          string
+
+	// DataPath is the Alloy data directory used to persist graceful-leave
+	// recovery state.
+	DataPath string
+
+	// Graceful leave timing. Zero values fall back to the cluster package
+	// defaults; they are primarily exposed for tests.
+	LeaveBroadcastTimeout   time.Duration
+	LeaveConvergeTimeout    time.Duration
+	LeaveConvergeStableFor  time.Duration
+	ComponentHandoffTimeout time.Duration
+	LeaveRecoveryDelay      time.Duration
 }
 
 func buildClusterService(opts ClusterOptions) (*cluster.Service, error) {
@@ -69,6 +81,14 @@ func NewClusterService(
 		TLSCertPath:            opts.TLSCertPath,
 		TLSKeyPath:             opts.TLSKeyPath,
 		TLSServerName:          opts.TLSServerName,
+
+		DataPath: opts.DataPath,
+
+		LeaveBroadcastTimeout:   opts.LeaveBroadcastTimeout,
+		LeaveConvergeTimeout:    opts.LeaveConvergeTimeout,
+		LeaveConvergeStableFor:  opts.LeaveConvergeStableFor,
+		ComponentHandoffTimeout: opts.ComponentHandoffTimeout,
+		LeaveRecoveryDelay:      opts.LeaveRecoveryDelay,
 	}
 
 	if config.NodeName == "" {

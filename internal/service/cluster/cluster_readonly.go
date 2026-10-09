@@ -68,6 +68,14 @@ type alloyCluster struct {
 	rwMutex       sync.RWMutex
 	deadlineTimer *time.Timer
 	clusterState  clusterState
+
+	// ownershipUpdatesFrozen is set during a graceful leave. While true, peer
+	// changes are not propagated to components so they keep acting on the
+	// ownership snapshot captured at the start of the leave. The local sharder
+	// itself is not frozen: write (OpReadWrite) lookups still reflect the
+	// node's Terminating state, while read (OpRead) lookups keep considering
+	// the node as an eligible owner.
+	ownershipUpdatesFrozen bool
 }
 
 var _ Cluster = (*alloyCluster)(nil)
@@ -251,4 +259,28 @@ func (c *alloyCluster) shutdown() {
 	if c.deadlineTimer != nil {
 		c.deadlineTimer.Stop()
 	}
+}
+
+// freezeOwnershipUpdates stops propagating cluster changes to components.
+// Components keep acting on the ownership view they had when the freeze
+// started until an explicit hand-off notification is delivered.
+func (c *alloyCluster) freezeOwnershipUpdates() {
+	c.rwMutex.Lock()
+	defer c.rwMutex.Unlock()
+	c.ownershipUpdatesFrozen = true
+}
+
+// resumeOwnershipUpdates re-enables propagation of cluster changes to
+// components after a leave was aborted before publishing Terminating.
+func (c *alloyCluster) resumeOwnershipUpdates() {
+	c.rwMutex.Lock()
+	defer c.rwMutex.Unlock()
+	c.ownershipUpdatesFrozen = false
+}
+
+// isFrozen reports whether component notifications are currently suppressed.
+func (c *alloyCluster) isFrozen() bool {
+	c.rwMutex.RLock()
+	defer c.rwMutex.RUnlock()
+	return c.ownershipUpdatesFrozen
 }
